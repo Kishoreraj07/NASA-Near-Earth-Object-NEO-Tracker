@@ -576,24 +576,6 @@ def main():
                                                   help="Limit the total number of asteroid records to collect")
             
             submit_button = st.form_submit_button("Collect Data")
-        st.subheader("Clear Database")
-        with st.form("delete_records_form"):
-            st.warning("This will delete all records from the database. This action cannot be undone.")
-            confirm_delete = st.checkbox("I confirm I want to delete all records")
-            delete_button = st.form_submit_button("Delete All Records")
-            
-            if delete_button:
-                if confirm_delete:
-                    try:
-                        delete_all_records()
-                        st.success("✅ All records have been deleted from the database.")
-                        logger.debug("Delete operation completed successfully")
-                    except Exception as e:
-                        st.error(f"Failed to delete records: {str(e)}")
-                        logger.error(f"Delete operation failed: {str(e)}")
-                else:
-                    st.error("Please check the confirmation box to delete all records.")
-        
         if submit_button:
             if not api_key:
                 st.error("Please enter your NASA API key")
@@ -630,6 +612,25 @@ def main():
                         st.error(f"Failed to insert data: {str(e)}")
                 else:
                     st.error("Failed to collect data. Please check your API key and try again.")
+        st.subheader("Clear Database")
+        with st.form("delete_records_form"):
+            st.warning("This will delete all records from the database. This action cannot be undone.")
+            confirm_delete = st.checkbox("I confirm I want to delete all records")
+            delete_button = st.form_submit_button("Delete All Records")
+            
+            if delete_button:
+                if confirm_delete:
+                    try:
+                        delete_all_records()
+                        st.success("✅ All records have been deleted from the database.")
+                        logger.debug("Delete operation completed successfully")
+                    except Exception as e:
+                        st.error(f"Failed to delete records: {str(e)}")
+                        logger.error(f"Delete operation failed: {str(e)}")
+                else:
+                    st.error("Please check the confirmation box to delete all records.")
+        
+        
     
     elif page == "Predefined Queries":
         st.header("📊 Predefined Analytical Queries")
