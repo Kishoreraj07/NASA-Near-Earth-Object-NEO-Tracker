@@ -30,5 +30,5 @@ You can run this app locally using Streamlit. See below for instructions.
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/your-username/nasa-neo-tracker.git
+git clone https://github.com/Kishoreraj07/NASA-Near-Earth-Object-NEO-Tracker.git
 cd nasa-neo-tracker
