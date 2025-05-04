@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 import time
 import matplotlib.pyplot as plt
 import seaborn as sns
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 st.set_page_config(
@@ -15,16 +19,16 @@ st.set_page_config(
     layout="wide"
 )
 
-
 def setup_database():
-    """Create SQLite database and required tables if they don't exist"""
+    """Create SQLite database and required tables, or update schema if needed"""
     conn = sqlite3.connect('nasa_neo_data.db')
     cursor = conn.cursor()
     
-   
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS asteroids (
         id INTEGER PRIMARY KEY,
+        neo_reference_id INTEGER,
         name TEXT,
         absolute_magnitude_h FLOAT,
         estimated_diameter_min_km FLOAT,
@@ -33,7 +37,18 @@ def setup_database():
     )
     ''')
     
+
+    cursor.execute("PRAGMA table_info(asteroids)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'neo_reference_id' not in columns:
+        logger.debug("Adding neo_reference_id column to asteroids table")
+        cursor.execute('ALTER TABLE asteroids ADD COLUMN neo_reference_id INTEGER')
+
+        cursor.execute('UPDATE asteroids SET neo_reference_id = id WHERE neo_reference_id IS NULL')
+
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_neo_reference_id_unique ON asteroids(neo_reference_id)')
     
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS close_approach (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,11 +59,10 @@ def setup_database():
         miss_distance_km FLOAT,
         miss_distance_lunar FLOAT,
         orbiting_body TEXT,
-        FOREIGN KEY (neo_reference_id) REFERENCES asteroids(id)
+        FOREIGN KEY (neo_reference_id) REFERENCES asteroids(neo_reference_id)
     )
     ''')
-    
-    
+
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_neo_reference_id ON close_approach(neo_reference_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_close_approach_date ON close_approach(close_approach_date)')
     
@@ -76,7 +90,6 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
     current_date = datetime.strptime(start_date, "%Y-%m-%d")
     periods_fetched = 0
     
-    
     if not days_to_fetch:
         progress_text = f"Fetching NASA NEO data (target: {max_records} records)"
     else:
@@ -86,14 +99,14 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
     status_text = st.empty()
     
     while True:
-       
+
         end_date = current_date + timedelta(days=6)
         
         start_str = current_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
-
+        
         status_text.text(f"{progress_text}: Processing {start_str} to {end_str}")
-   
+        
         url = f"https://api.nasa.gov/neo/rest/v1/feed?start_date={start_str}&end_date={end_str}&api_key={api_key}"
         
         try:
@@ -103,12 +116,12 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
                 break
                 
             data = response.json()
-         
+            
             for date_str, daily_asteroids in data["near_earth_objects"].items():
                 for asteroid in daily_asteroids:
-                
                     if not all([
                         asteroid.get("id"),
+                        asteroid.get("neo_reference_id"),
                         asteroid.get("name"),
                         asteroid.get("close_approach_data")
                     ]):
@@ -116,6 +129,7 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
                     
                     asteroid_info = {
                         "id": int(asteroid.get("id")),
+                        "neo_reference_id": int(asteroid.get("neo_reference_id")),
                         "name": asteroid.get("name"),
                         "absolute_magnitude_h": float(asteroid.get("absolute_magnitude_h")) if asteroid.get("absolute_magnitude_h") else None,
                         "estimated_diameter_min_km": float(asteroid.get("estimated_diameter", {}).get("kilometers", {}).get("estimated_diameter_min", 0)),
@@ -123,12 +137,11 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
                         "is_potentially_hazardous_asteroid": asteroid.get("is_potentially_hazardous_asteroid", False)
                     }
                     
-
                     for approach in asteroid.get("close_approach_data", []):
                         if not approach.get("close_approach_date"):
                             continue
                         approach_info = {
-                            "neo_reference_id": int(asteroid.get("id")),
+                            "neo_reference_id": int(asteroid.get("neo_reference_id")),
                             "close_approach_date": approach.get("close_approach_date"),
                             "relative_velocity_kmph": float(approach.get("relative_velocity", {}).get("kilometers_per_hour", 0)),
                             "astronomical": float(approach.get("miss_distance", {}).get("astronomical", 0)),
@@ -140,24 +153,24 @@ def fetch_nasa_neo_data(api_key, start_date, days_to_fetch=None, max_records=100
                     
                     asteroid_data.append(asteroid_info)
                     record_count += 1
-   
+            
             if days_to_fetch:
                 progress_bar.progress(min(1.0, (periods_fetched + 1) / days_to_fetch))
             else:
                 progress_bar.progress(min(1.0, record_count / max_records))
-
+            
             periods_fetched += 1
             if (days_to_fetch and periods_fetched >= days_to_fetch) or record_count >= max_records:
                 break
-
+            
             current_date = end_date + timedelta(days=1)
-
+            
             time.sleep(0.1)
             
         except Exception as e:
             st.error(f"Error: {str(e)}")
             break
- 
+    
     progress_bar.empty()
     status_text.empty()
     
@@ -168,24 +181,22 @@ def insert_data_to_database(asteroid_data, approach_data):
     conn = sqlite3.connect('nasa_neo_data.db')
     cursor = conn.cursor()
     
-   
-    cursor.execute("DELETE FROM asteroids")
-    cursor.execute("DELETE FROM close_approach")
-
     for asteroid in asteroid_data:
         cursor.execute('''
-        INSERT INTO asteroids (id, name, absolute_magnitude_h, estimated_diameter_min_km, 
-                             estimated_diameter_max_km, is_potentially_hazardous_asteroid)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO asteroids (id, neo_reference_id, name, absolute_magnitude_h, 
+                                        estimated_diameter_min_km, estimated_diameter_max_km, 
+                                        is_potentially_hazardous_asteroid)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (
             asteroid["id"],
+            asteroid["neo_reference_id"],
             asteroid["name"],
             asteroid["absolute_magnitude_h"],
             asteroid["estimated_diameter_min_km"],
             asteroid["estimated_diameter_max_km"],
             asteroid["is_potentially_hazardous_asteroid"]
         ))
-
+    
     for approach in approach_data:
         cursor.execute('''
         INSERT INTO close_approach (neo_reference_id, close_approach_date, relative_velocity_kmph,
@@ -206,6 +217,25 @@ def insert_data_to_database(asteroid_data, approach_data):
     
     return len(asteroid_data), len(approach_data)
 
+def delete_all_records():
+    """Delete all records from asteroids and close_approach tables"""
+    logger.debug("Attempting to delete all records from database")
+    try:
+        conn = sqlite3.connect('nasa_neo_data.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("DELETE FROM close_approach")
+        cursor.execute("DELETE FROM asteroids")
+        
+        conn.commit()
+        logger.debug("Successfully deleted all records")
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete records: {str(e)}")
+        conn.close()
+        raise Exception(f"Failed to delete records: {str(e)}")
+
 def database_has_data():
     """Check if the database already has asteroid data"""
     try:
@@ -218,13 +248,12 @@ def database_has_data():
     except:
         return False
 
-
 def get_predefined_queries():
     return {
         "1. Count approaches per asteroid": """
             SELECT a.name, COUNT(c.id) as approach_count
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY approach_count DESC
             LIMIT 20
@@ -232,7 +261,7 @@ def get_predefined_queries():
         "2. Average velocity per asteroid": """
             SELECT a.name, AVG(c.relative_velocity_kmph) as avg_velocity
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY avg_velocity DESC
             LIMIT 20
@@ -240,7 +269,7 @@ def get_predefined_queries():
         "3. Top 10 fastest asteroids": """
             SELECT a.name, MAX(c.relative_velocity_kmph) as max_velocity
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY max_velocity DESC
             LIMIT 10
@@ -248,7 +277,7 @@ def get_predefined_queries():
         "4. Hazardous asteroids with 3+ approaches": """
             SELECT a.name, COUNT(c.id) as approach_count
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             WHERE a.is_potentially_hazardous_asteroid = 1
             GROUP BY a.id, a.name
             HAVING COUNT(c.id) > 3
@@ -264,7 +293,7 @@ def get_predefined_queries():
         "6. Asteroid with fastest approach speed": """
             SELECT a.name, c.close_approach_date, c.relative_velocity_kmph
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             ORDER BY c.relative_velocity_kmph DESC
             LIMIT 1
         """,
@@ -277,7 +306,7 @@ def get_predefined_queries():
         "8. Asteroids getting closer over time": """
             SELECT a.name, c.close_approach_date, c.miss_distance_km
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             WHERE a.id IN (
                 SELECT neo_reference_id 
                 FROM close_approach 
@@ -290,7 +319,7 @@ def get_predefined_queries():
         "9. Closest approach per asteroid": """
             SELECT a.name, c.close_approach_date, MIN(c.miss_distance_km) as closest_approach_km
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY closest_approach_km
             LIMIT 20
@@ -298,7 +327,7 @@ def get_predefined_queries():
         "10. Fast asteroids (>50,000 km/h)": """
             SELECT DISTINCT a.name, c.relative_velocity_kmph
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             WHERE c.relative_velocity_kmph > 50000
             ORDER BY c.relative_velocity_kmph DESC
             LIMIT 30
@@ -329,7 +358,7 @@ def get_predefined_queries():
         "14. Closer than Moon (<1 LD)": """
             SELECT a.name, c.close_approach_date, c.miss_distance_lunar
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             WHERE c.miss_distance_lunar < 1
             ORDER BY c.miss_distance_lunar
             LIMIT 30
@@ -337,7 +366,7 @@ def get_predefined_queries():
         "15. Within 0.05 AU": """
             SELECT a.name, c.close_approach_date, c.astronomical
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             WHERE c.astronomical < 0.05
             ORDER BY c.astronomical
             LIMIT 30
@@ -352,7 +381,7 @@ def get_predefined_queries():
         "17. Asteroids approaching multiple bodies": """
             SELECT a.name, c.orbiting_body, COUNT(*) as approach_count
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name, c.orbiting_body
             ORDER BY approach_count DESC
             LIMIT 20
@@ -360,7 +389,7 @@ def get_predefined_queries():
         "18. Asteroids by approach frequency": """
             SELECT a.name, COUNT(c.id) as approach_count, a.estimated_diameter_max_km
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY approach_count DESC, a.estimated_diameter_max_km DESC
             LIMIT 20
@@ -368,14 +397,14 @@ def get_predefined_queries():
         "19. Recent close approaches": """
             SELECT a.name, c.close_approach_date, c.miss_distance_km
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             ORDER BY c.close_approach_date DESC
             LIMIT 30
         """,
         "20. Size-velocity correlation": """
             SELECT a.name, a.estimated_diameter_max_km, AVG(c.relative_velocity_kmph) as avg_velocity
             FROM asteroids a
-            JOIN close_approach c ON a.id = c.neo_reference_id
+            JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
             GROUP BY a.id, a.name
             ORDER BY a.estimated_diameter_max_km DESC
             LIMIT 30
@@ -401,9 +430,7 @@ def visualize_results(df, query_name):
         return
     
     try:
-        
         if "count" in query_name.lower() or "vs" in query_name.lower():
-
             fig, ax = plt.subplots(figsize=(10, max(6, min(df.shape[0] * 0.3, 15))))
             sns.barplot(data=df.head(20), y=df.columns[0], x=df.columns[1], ax=ax)
             plt.xlabel(df.columns[1])
@@ -413,7 +440,6 @@ def visualize_results(df, query_name):
             st.pyplot(fig)
         
         elif "month" in query_name.lower() and "by month" in query_name.lower():
-
             fig, ax = plt.subplots(figsize=(12, 6))
             sns.lineplot(data=df, x=df.columns[0], y=df.columns[1], marker='o', ax=ax)
             plt.xlabel('Month')
@@ -424,7 +450,6 @@ def visualize_results(df, query_name):
             st.pyplot(fig)
         
         elif ("diameter" in query_name.lower() or "size" in query_name.lower()) and "correlation" in query_name.lower():
-
             fig, ax = plt.subplots(figsize=(10, 6))
             sns.scatterplot(data=df, x=df.columns[1], y=df.columns[2], ax=ax)
             plt.xlabel('Diameter (km)')
@@ -434,7 +459,6 @@ def visualize_results(df, query_name):
             st.pyplot(fig)
         
         elif "velocity" in query_name.lower() and "fastest" not in query_name.lower():
-
             fig, ax = plt.subplots(figsize=(10, 6))
             sns.histplot(data=df, x=df.columns[1], bins=30, ax=ax)
             plt.xlabel('Velocity (km/h)')
@@ -444,7 +468,6 @@ def visualize_results(df, query_name):
             st.pyplot(fig)
         
         elif "diameter" in query_name.lower():
-
             fig, ax = plt.subplots(figsize=(10, 6))
             sns.boxplot(data=df, y=df.columns[1], ax=ax)
             plt.ylabel('Diameter (km)')
@@ -459,47 +482,46 @@ def filter_data(date_range, au_range, lunar_range, velocity_range, diameter_rang
     conn = sqlite3.connect('nasa_neo_data.db')
     
     query = """
-    SELECT a.name, a.absolute_magnitude_h, a.estimated_diameter_min_km, 
-           a.estimated_diameter_max_km, a.is_potentially_hazardous_asteroid,
-           c.close_approach_date, c.relative_velocity_kmph, c.astronomical, 
-           c.miss_distance_km, c.miss_distance_lunar, c.orbiting_body
+    SELECT a.id, a.neo_reference_id, a.name, a.absolute_magnitude_h, 
+           a.estimated_diameter_min_km, a.estimated_diameter_max_km, 
+           a.is_potentially_hazardous_asteroid, c.close_approach_date, 
+           c.relative_velocity_kmph, c.astronomical, c.miss_distance_km, 
+           c.miss_distance_lunar, c.orbiting_body
     FROM asteroids a
-    JOIN close_approach c ON a.id = c.neo_reference_id
+    JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id
     WHERE 1=1
     """
     
     params = []
-    
+
     if date_range and len(date_range) == 2:
         start_date, end_date = date_range
         query += " AND c.close_approach_date BETWEEN ? AND ?"
         params.extend([start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")])
-
     if au_range:
         min_au, max_au = au_range
         query += " AND c.astronomical BETWEEN ? AND ?"
         params.extend([min_au, max_au])
-    
 
     if lunar_range:
         min_lunar, max_lunar = lunar_range
         query += " AND c.miss_distance_lunar BETWEEN ? AND ?"
         params.extend([min_lunar, max_lunar])
-
+    
     if velocity_range:
         min_velocity, max_velocity = velocity_range
         query += " AND c.relative_velocity_kmph BETWEEN ? AND ?"
         params.extend([min_velocity, max_velocity])
-
+    
     if diameter_range:
         min_diameter, max_diameter = diameter_range
         query += " AND a.estimated_diameter_max_km BETWEEN ? AND ?"
         params.extend([min_diameter, max_diameter])
-
+    
     if hazardous is not None:
         query += " AND a.is_potentially_hazardous_asteroid = ?"
         params.append(1 if hazardous else 0)
-
+    
     query += " LIMIT 1000"
     
     try:
@@ -510,11 +532,11 @@ def filter_data(date_range, au_range, lunar_range, velocity_range, diameter_rang
         conn.close()
         st.error(f"Filter query failed: {str(e)}")
         return pd.DataFrame()
-
+    
 def main():
     st.title("🚀 NASA Near-Earth Object (NEO) Tracker")
     st.markdown("Explore data about asteroids that have passed near Earth.")
-
+    
     setup_database()
 
     st.sidebar.title("Navigation")
@@ -525,39 +547,57 @@ def main():
 
         has_data = database_has_data()
         if has_data:
-            st.info("Database already contains asteroid data. You can refresh it or explore using the sidebar options.")
+            st.info("Database already contains asteroid data. You can add more data, delete all records, or explore using the sidebar options.")
         
+        
+        st.subheader("Collect New Data")
         with st.form("data_collection_form"):
             col1, col2 = st.columns(2)
             
             with col1:
                 api_key = st.text_input("NASA API Key", placeholder="Enter your API key from api.nasa.gov", 
-                                      help="Get your free API key from https://api.nasa.gov")
+                                        help="Get your free API key from https://api.nasa.gov")
                 start_date = st.date_input("Start Date", value=datetime(2024, 1, 1), 
-                                         help="Date to start collecting data from")
+                                           help="Date to start collecting data from")
             
             with col2:
                 collection_option = st.radio("Collection Option", 
-                                          ["Fetch specific number of periods", "Fetch up to 10,000 records"],
-                                          index=1,
-                                          help="Choose how to limit data collection")
+                                            ["Fetch specific number of periods", "Fetch up to 10,000 records"],
+                                            index=1,
+                                            help="Choose how to limit data collection")
                 
                 if collection_option == "Fetch specific number of periods":
                     num_periods = st.number_input("Number of 7-day periods", min_value=1, max_value=100, value=10,
-                                                help="Each period is 7 days of data")
+                                                  help="Each period is 7 days of data")
                     max_records = None
                 else:
                     num_periods = None
                     max_records = st.number_input("Maximum records to collect", min_value=100, max_value=10000, value=10000,
-                                                help="Limit the total number of asteroid records to collect")
+                                                  help="Limit the total number of asteroid records to collect")
             
             submit_button = st.form_submit_button("Collect Data")
+        st.subheader("Clear Database")
+        with st.form("delete_records_form"):
+            st.warning("This will delete all records from the database. This action cannot be undone.")
+            confirm_delete = st.checkbox("I confirm I want to delete all records")
+            delete_button = st.form_submit_button("Delete All Records")
+            
+            if delete_button:
+                if confirm_delete:
+                    try:
+                        delete_all_records()
+                        st.success("✅ All records have been deleted from the database.")
+                        logger.debug("Delete operation completed successfully")
+                    except Exception as e:
+                        st.error(f"Failed to delete records: {str(e)}")
+                        logger.error(f"Delete operation failed: {str(e)}")
+                else:
+                    st.error("Please check the confirmation box to delete all records.")
         
         if submit_button:
             if not api_key:
                 st.error("Please enter your NASA API key")
             else:
-
                 start_time = time.time()
                 asteroid_data, approach_data = fetch_nasa_neo_data(
                     api_key=api_key,
@@ -565,38 +605,42 @@ def main():
                     days_to_fetch=num_periods,
                     max_records=max_records or 10000
                 )
-
+                
                 if asteroid_data:
-                    a_count, c_count = insert_data_to_database(asteroid_data, approach_data)
-                    end_time = time.time()
-                    
-                    st.success(f"✅ Successfully collected {a_count} asteroid records with {c_count} approach events " +
-                              f"in {end_time - start_time:.2f} seconds")
-
-                    if a_count > 0:
-                        st.subheader("Sample of collected asteroid data")
-                        conn = sqlite3.connect('nasa_neo_data.db')
-                        sample_data = pd.read_sql_query(
-                            "SELECT a.name, a.is_potentially_hazardous_asteroid, c.close_approach_date, " +
-                            "c.miss_distance_km, c.relative_velocity_kmph " +
-                            "FROM asteroids a JOIN close_approach c ON a.id = c.neo_reference_id LIMIT 10", 
-                            conn
-                        )
-                        conn.close()
-                        st.dataframe(sample_data)
+                    try:
+                        a_count, c_count = insert_data_to_database(asteroid_data, approach_data)
+                        end_time = time.time()
+                        
+                        st.success(f"✅ Successfully collected {a_count} asteroid records with {c_count} approach events " +
+                                   f"in {end_time - start_time:.2f} seconds")
+                        
+                        if a_count > 0:
+                            st.subheader("Sample of collected asteroid data")
+                            conn = sqlite3.connect('nasa_neo_data.db')
+                            sample_data = pd.read_sql_query(
+                                "SELECT a.id, a.neo_reference_id, a.name, a.is_potentially_hazardous_asteroid, " +
+                                "c.close_approach_date, c.miss_distance_km, c.relative_velocity_kmph, c.astronomical, " +
+                                "c.miss_distance_lunar, c.orbiting_body " +
+                                "FROM asteroids a JOIN close_approach c ON a.neo_reference_id = c.neo_reference_id LIMIT 10", 
+                                conn
+                            )
+                            conn.close()
+                            st.dataframe(sample_data)
+                    except Exception as e:
+                        st.error(f"Failed to insert data: {str(e)}")
                 else:
                     st.error("Failed to collect data. Please check your API key and try again.")
     
     elif page == "Predefined Queries":
         st.header("📊 Predefined Analytical Queries")
-
+        
         if not database_has_data():
             st.warning("No asteroid data found in database. Please collect data first.")
             return
-
+        
         queries = get_predefined_queries()
         selected_query = st.selectbox("Select a query to analyze:", list(queries.keys()))
-
+        
         query_descriptions = {
             "1. Count approaches per asteroid": "Shows how many times each asteroid has approached Earth.",
             "2. Average velocity per asteroid": "Calculates the average velocity of each asteroid over multiple approaches.",
@@ -621,7 +665,7 @@ def main():
         }
         
         st.markdown(f"**Description:** {query_descriptions.get(selected_query, '')}")
-
+        
         if st.button("Run Query"):
             with st.spinner("Executing query..."):
                 results = execute_query(queries[selected_query])
@@ -632,7 +676,7 @@ def main():
                     
                     st.subheader("Visualization")
                     visualize_results(results, selected_query)
-
+                    
                     csv = results.to_csv(index=False).encode('utf-8')
                     st.download_button(
                         "Download results as CSV",
@@ -650,7 +694,7 @@ def main():
         if not database_has_data():
             st.warning("No asteroid data found in database. Please collect data first.")
             return
-
+        
         conn = sqlite3.connect('nasa_neo_data.db')
         min_max_df = pd.read_sql_query("""
             SELECT 
@@ -665,7 +709,7 @@ def main():
                 MIN(a.estimated_diameter_max_km) as min_diameter,
                 MAX(a.estimated_diameter_max_km) as max_diameter
             FROM close_approach c
-            JOIN asteroids a ON c.neo_reference_id = a.id
+            JOIN asteroids a ON c.neo_reference_id = a.neo_reference_id
         """, conn)
         conn.close()
         
@@ -681,9 +725,9 @@ def main():
             max_velocity = min(float(min_max_df['max_velocity'].iloc[0]), 100000.0)  
             min_diameter = float(min_max_df['min_diameter'].iloc[0])
             max_diameter = min(float(min_max_df['max_diameter'].iloc[0]), 10.0)  
-
+            
             st.sidebar.header("Filter Options")
-
+            
             date_range = st.sidebar.date_input(
                 "Approach Date Range",
                 value=(min_date, max_date),
@@ -710,7 +754,6 @@ def main():
                 help="Filter by distance in lunar distances (1 LD ≈ distance from Earth to Moon)"
             )
             
-
             velocity_range = st.sidebar.slider(
                 "Relative Velocity (km/h)",
                 min_value=min_velocity,
@@ -752,7 +795,7 @@ def main():
                         st.dataframe(filtered_results)
                         
                         st.subheader("Visualizations")
-
+                        
                         fig, ax = plt.subplots(figsize=(10, 6))
                         sns.scatterplot(
                             data=filtered_results,
@@ -781,7 +824,7 @@ def main():
                         plt.title("Distribution of Miss Distances")
                         plt.tight_layout()
                         st.pyplot(fig)
-
+                        
                         csv = filtered_results.to_csv(index=False).encode('utf-8')
                         st.download_button(
                             "Download filtered results as CSV",
